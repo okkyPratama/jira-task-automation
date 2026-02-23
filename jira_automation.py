@@ -46,10 +46,10 @@ JIRA_ACCOUNT_ID: str = ''
 # Schedule definition
 SCHEDULE = {
     '8AM': {
-        'target_time': datetime.time(8, 0, 0, 0),
+        'target_time': datetime.time(8, 0, 0, 0),   # fallback only; actual time = cf[10093]
         'from_status': 'SUPPORT OPEN',
         'transition_name': 'INPROGRESS SUPPORT',
-        'description': 'Start work',
+        'description': 'Start work (time from cf[10093])',
     },
     '12PM': {
         'target_time': datetime.time(12, 0, 0, 0),
@@ -64,10 +64,10 @@ SCHEDULE = {
         'description': 'Resume work',
     },
     '5PM': {
-        'target_time': datetime.time(17, 0, 0, 0),
+        'target_time': datetime.time(17, 0, 0, 0),  # fallback only; actual time = cf[10094]
         'from_status': 'SUPPORT INPROGRESS',
         'transition_name': 'Support Done',
-        'description': 'End work',
+        'description': 'End work (time from cf[10094])',
     },
 }
 
@@ -145,12 +145,13 @@ def search_issues(jql: str) -> list:
     """
     POST /rest/api/3/search/jql
     Returns list of issues or empty list on error.
+    Also fetches cf[10093] (plan start) and cf[10094] (plan end) for each issue.
     """
     url = f'{JIRA_DOMAIN}/rest/api/3/search/jql'
     payload = {
         'jql': jql,
         'maxResults': 10,
-        'fields': ['key', 'summary', 'status'],
+        'fields': ['key', 'summary', 'status', 'customfield_10093', 'customfield_10094'],
     }
     try:
         response = requests.post(
@@ -326,6 +327,29 @@ def wait_for_precise_time(target_time: datetime.time) -> None:
 # Main Logic Functions
 # ---------------------------------------------------------------------------
 
+# Jira returns timestamps in ISO-8601, e.g. "2026-02-23T08:00:00.000+0700"
+_JIRA_TS_FORMATS = [
+    '%Y-%m-%dT%H:%M:%S.%f%z',
+    '%Y-%m-%dT%H:%M:%S%z',
+]
+
+
+def parse_issue_datetime(field_value: str) -> datetime.datetime:
+    """
+    Parse a Jira timestamp string into a timezone-aware datetime.
+    Returns None if parsing fails.
+    """
+    if not field_value:
+        return None
+    for fmt in _JIRA_TS_FORMATS:
+        try:
+            return datetime.datetime.strptime(field_value, fmt)
+        except ValueError:
+            continue
+    logger.warning('Could not parse Jira datetime value: %r', field_value)
+    return None
+
+
 def build_jql(from_status: str) -> str:
     """
     Builds JQL query string.
@@ -341,21 +365,96 @@ def build_jql(from_status: str) -> str:
     return jql
 
 
+def _execute_transition_for_issue(issue: dict, transition_name: str) -> None:
+    """
+    Fetch transitions for a single issue, find the right one by name, and execute it.
+    Logs success/failure with microsecond timestamps.
+    """
+    issue_key = issue['key']
+    summary = issue.get('fields', {}).get('summary', '(no summary)')
+    logger.info('Processing issue: %s - %s', issue_key, summary)
+
+    transitions = get_transitions(issue_key)
+    if not transitions:
+        logger.warning('No transitions available for %s. Skipping.', issue_key)
+        return
+
+    transition_id = find_transition_id(transitions, transition_name)
+    if transition_id is None:
+        available = [t['name'] for t in transitions]
+        logger.error(
+            'Transition "%s" not found for %s. Available transitions: %s',
+            transition_name, issue_key, available,
+        )
+        return
+
+    logger.info('Executing transition "%s" (id=%s) on %s', transition_name, transition_id, issue_key)
+    success, ts_before, ts_after = transition_issue(issue_key, transition_id)
+
+    if success:
+        logger.info(
+            'SUCCESS: %s transitioned via "%s" | before=%s | after=%s',
+            issue_key, transition_name, ts_before, ts_after,
+        )
+    else:
+        logger.error(
+            'FAILED: Could not transition %s via "%s" | before=%s | after=%s',
+            issue_key, transition_name, ts_before, ts_after,
+        )
+
+
+def _resolve_target_time_for_issue(issue: dict, time_slot: str, fallback: datetime.time) -> datetime.time:
+    """
+    For 8AM slot:  use cf[10093] (plan start) time component.
+    For 5PM slot:  use cf[10094] (plan end) time component.
+    For all other slots: return fallback (fixed time).
+
+    If the field is missing or unparseable, log a warning and use fallback.
+    Strips timezone so the time can be compared with local clock.
+    """
+    fields = issue.get('fields', {})
+
+    if time_slot == '8AM':
+        raw = fields.get('customfield_10093')
+    elif time_slot == '5PM':
+        raw = fields.get('customfield_10094')
+    else:
+        return fallback
+
+    dt = parse_issue_datetime(raw)
+    if dt is None:
+        logger.warning(
+            '%s: could not read plan datetime for slot %s, falling back to %s',
+            issue['key'], time_slot, fallback,
+        )
+        return fallback
+
+    # Convert to local naive time so it matches datetime.datetime.now()
+    local_dt = dt.astimezone().replace(tzinfo=None)
+    logger.info(
+        '%s: plan datetime for slot %s = %s (local)',
+        issue['key'], time_slot, local_dt.strftime('%Y-%m-%d %H:%M:%S'),
+    )
+    return local_dt.time()
+
+
 def run_automation(time_slot: str, wait_for_exact_time: bool = True) -> None:
     """
     Main automation function for a specific time slot.
 
+    For 8AM and 5PM slots each issue is transitioned at its own plan
+    start/end time read from cf[10093] / cf[10094] respectively.
+    For 12PM and 1PM slots a fixed hold/resume time is used for all issues.
+
     Steps:
     1. Validate time_slot is in SCHEDULE dict
-    2. Get config (from_status, transition_name, target_time, description)
-    3. Build JQL and search for issues
+    2. Get config (from_status, transition_name, fallback target_time, description)
+    3. Build JQL and search for issues (includes cf[10093] and cf[10094] fields)
     4. If no issues found, log and return
-    5. If wait_for_exact_time is True, call wait_for_precise_time()
-    6. For each issue:
-       a. Get available transitions
-       b. Find matching transition by name
-       c. Execute transition
-       d. Log success/failure with timestamps
+    5. For each issue:
+       a. Resolve the target time (per-issue for 8AM/5PM, fixed for 12PM/1PM)
+       b. If wait_for_exact_time is True, wait for that time
+       c. Execute the transition
     """
     if time_slot not in SCHEDULE:
         logger.error('Invalid time slot: %s. Must be one of %s', time_slot, list(SCHEDULE.keys()))
@@ -364,7 +463,7 @@ def run_automation(time_slot: str, wait_for_exact_time: bool = True) -> None:
     config = SCHEDULE[time_slot]
     from_status = config['from_status']
     transition_name = config['transition_name']
-    target_time = config['target_time']
+    fallback_time = config['target_time']
     description = config['description']
 
     logger.info('=== Running automation for %s (%s) ===', time_slot, description)
@@ -381,41 +480,13 @@ def run_automation(time_slot: str, wait_for_exact_time: bool = True) -> None:
 
     logger.info('Found %d issue(s): %s', len(issues), [i['key'] for i in issues])
 
-    if wait_for_exact_time:
-        wait_for_precise_time(target_time)
-
     for issue in issues:
-        issue_key = issue['key']
-        summary = issue.get('fields', {}).get('summary', '(no summary)')
-        logger.info('Processing issue: %s - %s', issue_key, summary)
+        target_time = _resolve_target_time_for_issue(issue, time_slot, fallback_time)
 
-        transitions = get_transitions(issue_key)
-        if not transitions:
-            logger.warning('No transitions available for %s. Skipping.', issue_key)
-            continue
+        if wait_for_exact_time:
+            wait_for_precise_time(target_time)
 
-        transition_id = find_transition_id(transitions, transition_name)
-        if transition_id is None:
-            available = [t['name'] for t in transitions]
-            logger.error(
-                'Transition "%s" not found for %s. Available transitions: %s',
-                transition_name, issue_key, available,
-            )
-            continue
-
-        logger.info('Executing transition "%s" (id=%s) on %s', transition_name, transition_id, issue_key)
-        success, ts_before, ts_after = transition_issue(issue_key, transition_id)
-
-        if success:
-            logger.info(
-                'SUCCESS: %s transitioned via "%s" | before=%s | after=%s',
-                issue_key, transition_name, ts_before, ts_after,
-            )
-        else:
-            logger.error(
-                'FAILED: Could not transition %s via "%s" | before=%s | after=%s',
-                issue_key, transition_name, ts_before, ts_after,
-            )
+        _execute_transition_for_issue(issue, transition_name)
 
 
 def get_current_time_slot() -> str:
@@ -460,10 +531,11 @@ def calculate_duration() -> None:
     total_us = int(total.total_seconds() * 1_000_000)
 
     print('\n=== Duration Calculation ===')
-    print(f'Working Period 1: {period1_start} - {period1_end} = {period1}')
-    print(f'Lunch Break:      {lunch_start} - {lunch_end} = {lunch} (NOT counted)')
-    print(f'Working Period 2: {period2_start} - {period2_end} = {period2}')
-    print(f'Total:            {total} ({total_us:,} microseconds)')
+    print(f'Working Period 1: cf[10093] (plan start) - {period1_end} (hold) = {period1}')
+    print(f'Lunch Break:      {lunch_start} - {lunch_end} = {lunch} (NOT counted, fixed)')
+    print(f'Working Period 2: {period2_start} (resume) - cf[10094] (plan end) = {period2}')
+    print(f'Example total:    {total} ({total_us:,} microseconds)  [assumes 8AM start / 5PM end]')
+    print('Note: Actual start/end times are read per-issue from Jira custom fields.')
     print('============================\n')
 
 
