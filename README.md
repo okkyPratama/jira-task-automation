@@ -129,6 +129,55 @@ python jira_automation.py
 
 ---
 
+## Railway Deployment
+
+The project ships with a `scheduler.py` that keeps the process alive and fires
+each time slot at the right moment. Railway runs it as a **Worker** service.
+
+### Files added for Railway
+
+| File | Purpose |
+|------|---------|
+| `scheduler.py` | Long-running worker — fires each slot 1 min early (UTC) |
+| `railway.toml` | Tells Railway to run `python scheduler.py` |
+| `Procfile` | Fallback start command (`worker: python scheduler.py`) |
+
+### UTC → WIB time mapping
+
+| UTC trigger | WIB (UTC+7) | Slot |
+|-------------|-------------|------|
+| 00:59 | 07:59 | 8AM — waits to 08:00:00 exact |
+| 04:59 | 11:59 | 12PM — waits to 12:00:00 exact |
+| 05:59 | 12:59 | 1PM — waits to 13:00:00 exact |
+| 09:59 | 16:59 | 5PM — waits to 17:00:00 exact |
+
+### Deploy steps
+
+1. **Push** all files to GitHub (make sure `.env` is in `.gitignore` — it is)
+2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
+3. Select your repository
+4. In the service settings → **Variables**, add:
+   ```
+   JIRA_DOMAIN=https://mufpm.atlassian.net
+   JIRA_EMAIL=okky.pratama@muf.co.id
+   JIRA_API_TOKEN=your_api_token_here
+   ```
+5. Railway will detect `railway.toml` and run `python scheduler.py` automatically
+6. Check the **Logs** tab — you should see:
+   ```
+   Jira Automation Scheduler started (Railway / UTC clock)
+   Slots scheduled (UTC → WIB): ...
+   ```
+
+> **Note:** Railway's container clock runs in UTC. The scheduler accounts for
+> this — all times in `scheduler.py` are in UTC. The `jira_automation.py`
+> script itself uses the system clock for `wait_for_precise_time()`, which will
+> also be UTC on Railway — but since it only waits for the **time component**
+> (not the date), and the scheduler already fires at the correct UTC time,
+> everything aligns correctly.
+
+---
+
 ## Windows Task Scheduler Setup
 
 Create four scheduled tasks so the script launches **1 minute early** and
