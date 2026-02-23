@@ -1,0 +1,48 @@
+# =============================================================================
+# Jira Task Automation - .gitignore
+# =============================================================================
+
+# ── Environment & Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+setup_env.bat
+*.env
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+jira_automation.log
+
+# ── OS & Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+*.bak
+*.tmp
+*.swp
