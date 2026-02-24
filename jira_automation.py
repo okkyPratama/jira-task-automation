@@ -43,6 +43,21 @@ JIRA_API_TOKEN = os.environ.get('JIRA_API_TOKEN', '')
 # Cached account ID (populated by initialize_account_id)
 JIRA_ACCOUNT_ID: str = ''
 
+# WIB = Asia/Jakarta = UTC+7  (no DST)
+_WIB = datetime.timezone(datetime.timedelta(hours=7))
+
+
+def now_wib() -> datetime.datetime:
+    """Return the current time as a naive datetime in WIB (UTC+7).
+
+    Using a naive datetime keeps the rest of the code simple — we strip the
+    timezone info so comparisons with other naive datetimes work unchanged.
+    On Railway the system clock is UTC, so this is the critical conversion.
+    On a local WIB machine datetime.now() already returns WIB time, and
+    astimezone(_WIB).replace(tzinfo=None) still gives the correct WIB value.
+    """
+    return datetime.datetime.now(tz=_WIB).replace(tzinfo=None)
+
 # Schedule definition
 SCHEDULE = {
     '8AM': {
@@ -97,13 +112,17 @@ def get_current_user() -> dict:
     Returns None on error.
     """
     url = f'{JIRA_DOMAIN}/rest/api/3/myself'
+    logger.debug('REQUEST  GET %s', url)
     try:
+        t0 = time.perf_counter()
         response = requests.get(
             url,
             auth=get_auth(),
             headers={'Accept': 'application/json'},
             timeout=30,
         )
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.debug('RESPONSE %d  %.0fms  GET %s', response.status_code, elapsed, url)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.HTTPError as exc:
@@ -153,7 +172,10 @@ def search_issues(jql: str) -> list:
         'maxResults': 10,
         'fields': ['key', 'summary', 'status', 'customfield_10093', 'customfield_10094'],
     }
+    logger.info('REQUEST  POST %s', url)
+    logger.info('         JQL: %s', jql)
     try:
+        t0 = time.perf_counter()
         response = requests.post(
             url,
             auth=get_auth(),
@@ -164,9 +186,14 @@ def search_issues(jql: str) -> list:
             json=payload,
             timeout=30,
         )
-        response.raise_for_status()
+        elapsed = (time.perf_counter() - t0) * 1000
         data = response.json()
-        return data.get('issues', [])
+        issues = data.get('issues', [])
+        is_last = data.get('isLast', True)
+        logger.info('RESPONSE %d  %.0fms  issues=%d  isLast=%s  POST %s',
+                    response.status_code, elapsed, len(issues), is_last, url)
+        response.raise_for_status()
+        return issues
     except requests.exceptions.HTTPError as exc:
         logger.error('HTTP error searching issues: %s', exc)
         try:
@@ -185,16 +212,23 @@ def get_transitions(issue_key: str) -> list:
     Returns list of available transitions or empty list on error.
     """
     url = f'{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}/transitions'
+    logger.info('REQUEST  GET %s', url)
     try:
+        t0 = time.perf_counter()
         response = requests.get(
             url,
             auth=get_auth(),
             headers={'Accept': 'application/json'},
             timeout=30,
         )
-        response.raise_for_status()
+        elapsed = (time.perf_counter() - t0) * 1000
         data = response.json()
-        return data.get('transitions', [])
+        transitions = data.get('transitions', [])
+        names = [t['name'] for t in transitions]
+        logger.info('RESPONSE %d  %.0fms  transitions=%s  GET %s',
+                    response.status_code, elapsed, names, url)
+        response.raise_for_status()
+        return transitions
     except requests.exceptions.HTTPError as exc:
         logger.error('HTTP error fetching transitions for %s: %s', issue_key, exc)
         try:
@@ -215,8 +249,11 @@ def transition_issue(issue_key: str, transition_id: str) -> tuple:
     """
     url = f'{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}/transitions'
     payload = {'transition': {'id': transition_id}}
+    logger.info('REQUEST  POST %s', url)
+    logger.info('         Body: %s', payload)
     timestamp_before = get_precise_timestamp()
     try:
+        t0 = time.perf_counter()
         response = requests.post(
             url,
             auth=get_auth(),
@@ -227,9 +264,13 @@ def transition_issue(issue_key: str, transition_id: str) -> tuple:
             json=payload,
             timeout=30,
         )
+        elapsed = (time.perf_counter() - t0) * 1000
         timestamp_after = get_precise_timestamp()
+        # Log response — 204 has no body, anything else log it
+        body = response.text.strip() if response.text.strip() else '(empty — 204 No Content)'
+        logger.info('RESPONSE %d  %.0fms  POST %s', response.status_code, elapsed, url)
+        logger.info('         Body: %s', body)
         response.raise_for_status()
-        # 204 No Content on success
         return (True, timestamp_before, timestamp_after)
     except requests.exceptions.HTTPError as exc:
         timestamp_after = get_precise_timestamp()
@@ -266,7 +307,7 @@ def get_precise_timestamp() -> str:
     Format: "%Y-%m-%d %H:%M:%S.%f"
     Example: "2026-02-23 08:00:00.000123"
     """
-    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    return now_wib().strftime('%Y-%m-%d %H:%M:%S.%f')
 
 
 def get_microseconds_since_midnight() -> int:
@@ -274,7 +315,7 @@ def get_microseconds_since_midnight() -> int:
     Returns microseconds elapsed since midnight.
     Used for precision tracking.
     """
-    now = datetime.datetime.now()
+    now = now_wib()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     delta = now - midnight
     return int(delta.total_seconds() * 1_000_000)
@@ -293,10 +334,13 @@ def wait_for_precise_time(target_time: datetime.time) -> None:
 
     Logs when target time is reached.
     """
-    logger.info('Waiting for target time: %s', target_time.strftime('%H:%M:%S'))
+    logger.info('Waiting for target time: %s WIB  (now: %s WIB)',
+                target_time.strftime('%H:%M:%S'), now_wib().strftime('%H:%M:%S'))
+
+    last_heartbeat = [now_wib()]  # list so it's mutable inside the loop
 
     while True:
-        now = datetime.datetime.now()
+        now = now_wib()
         target_dt = now.replace(
             hour=target_time.hour,
             minute=target_time.minute,
@@ -306,10 +350,18 @@ def wait_for_precise_time(target_time: datetime.time) -> None:
 
         # If the target already passed today, nothing to wait for
         if now >= target_dt:
-            logger.info('Target time reached: %s', get_precise_timestamp())
+            logger.info('Target time reached: %s WIB', get_precise_timestamp())
             return
 
         remaining_seconds = (target_dt - now).total_seconds()
+
+        # Heartbeat log every 30 s while waiting (keeps Railway logs alive)
+        if (now - last_heartbeat[0]).total_seconds() >= 30:
+            mins = int(remaining_seconds // 60)
+            secs = int(remaining_seconds % 60)
+            logger.info('Still waiting... %dm %ds remaining until %s WIB',
+                        mins, secs, target_time.strftime('%H:%M:%S'))
+            last_heartbeat[0] = now
 
         if remaining_seconds > 60:
             time.sleep(30)
@@ -355,7 +407,7 @@ def build_jql(from_status: str) -> str:
     Builds JQL query string.
     """
     account_id = initialize_account_id()
-    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    today = now_wib().strftime('%Y-%m-%d')
     jql = (
         f'assignee = "{account_id}" '
         f'AND status = "{from_status}" '
@@ -403,14 +455,17 @@ def _execute_transition_for_issue(issue: dict, transition_name: str) -> None:
         )
 
 
-def _resolve_target_time_for_issue(issue: dict, time_slot: str, fallback: datetime.time) -> datetime.time:
+def _resolve_target_time_for_issue(
+    issue: dict, time_slot: str, fallback: datetime.time
+) -> 'datetime.time | None':
     """
     For 8AM slot:  use cf[10093] (plan start) time component.
     For 5PM slot:  use cf[10094] (plan end) time component.
     For all other slots: return fallback (fixed time).
 
-    If the field is missing or unparseable, log a warning and use fallback.
-    Strips timezone so the time can be compared with local clock.
+    Returns None if the plan date in the relevant field does not match
+    today's WIB date — signalling run_automation to skip this issue.
+    Returns the fallback time if the field is missing or unparseable.
     """
     fields = issue.get('fields', {})
 
@@ -419,6 +474,7 @@ def _resolve_target_time_for_issue(issue: dict, time_slot: str, fallback: dateti
     elif time_slot == '5PM':
         raw = fields.get('customfield_10094')
     else:
+        # 12PM and 1PM use fixed times; JQL already guarantees cf[10093] is today
         return fallback
 
     dt = parse_issue_datetime(raw)
@@ -429,13 +485,29 @@ def _resolve_target_time_for_issue(issue: dict, time_slot: str, fallback: dateti
         )
         return fallback
 
-    # Convert to local naive time so it matches datetime.datetime.now()
-    local_dt = dt.astimezone().replace(tzinfo=None)
+    # Convert to WIB naive datetime so it matches now_wib()
+    wib_dt = dt.astimezone(_WIB).replace(tzinfo=None)
+    today_wib = now_wib().date()
+
+    # Date guard: the plan date must be TODAY (WIB).
+    # - For 8AM: cf[10093] date must be today   (JQL already enforces this,
+    #            but we double-check here for safety)
+    # - For 5PM: cf[10094] date must be today   (JQL only filters cf[10093],
+    #            so this is the only place that validates the end date)
+    if wib_dt.date() != today_wib:
+        logger.warning(
+            '%s: plan date for slot %s is %s — expected today (%s). '
+            'Skipping this issue.',
+            issue['key'], time_slot,
+            wib_dt.strftime('%Y-%m-%d'), today_wib,
+        )
+        return None  # caller (run_automation) will skip this issue
+
     logger.info(
-        '%s: plan datetime for slot %s = %s (local)',
-        issue['key'], time_slot, local_dt.strftime('%Y-%m-%d %H:%M:%S'),
+        '%s: plan datetime for slot %s = %s WIB ✓ (matches today)',
+        issue['key'], time_slot, wib_dt.strftime('%Y-%m-%d %H:%M:%S'),
     )
-    return local_dt.time()
+    return wib_dt.time()
 
 
 def run_automation(time_slot: str, wait_for_exact_time: bool = True) -> None:
@@ -478,10 +550,33 @@ def run_automation(time_slot: str, wait_for_exact_time: bool = True) -> None:
         logger.info('No issues found for status "%s" today. Nothing to transition.', from_status)
         return
 
-    logger.info('Found %d issue(s): %s', len(issues), [i['key'] for i in issues])
+    # ── Task summary table ────────────────────────────────────────────────────
+    logger.info('Found %d issue(s) to process today:', len(issues))
+    logger.info('  %-20s %-16s %-22s %-22s %s',
+                'Key', 'Status', 'Plan Start (WIB)', 'Plan End (WIB)', 'Summary')
+    logger.info('  %s', '-' * 100)
+    for iss in issues:
+        f = iss.get('fields', {})
+        start_raw = f.get('customfield_10093', '')
+        end_raw   = f.get('customfield_10094', '')
+        start_dt  = parse_issue_datetime(start_raw)
+        end_dt    = parse_issue_datetime(end_raw)
+        start_str = start_dt.astimezone(_WIB).strftime('%Y-%m-%d %H:%M') if start_dt else 'N/A'
+        end_str   = end_dt.astimezone(_WIB).strftime('%Y-%m-%d %H:%M')   if end_dt   else 'N/A'
+        summary   = f.get('summary', '(no summary)')[:45]
+        status    = f.get('status', {}).get('name', 'unknown')
+        logger.info('  %-20s %-16s %-22s %-22s %s',
+                    iss['key'], status, start_str, end_str, summary)
+    logger.info('  %s', '-' * 100)
+    # ─────────────────────────────────────────────────────────────────────────
 
     for issue in issues:
         target_time = _resolve_target_time_for_issue(issue, time_slot, fallback_time)
+
+        if target_time is None:
+            # Plan date does not match today — warning already logged inside
+            # _resolve_target_time_for_issue. Skip this issue entirely.
+            continue
 
         if wait_for_exact_time:
             wait_for_precise_time(target_time)
@@ -499,7 +594,7 @@ def get_current_time_slot() -> str:
     - "1PM"  if hour < 17
     - "5PM"  otherwise
     """
-    hour = datetime.datetime.now().hour
+    hour = now_wib().hour
     if hour < 12:
         return '8AM'
     if hour < 13:
@@ -585,7 +680,7 @@ def check_weekday() -> None:
     """
     Exits gracefully if today is Saturday (5) or Sunday (6).
     """
-    weekday = datetime.datetime.now().weekday()
+    weekday = now_wib().weekday()
     if weekday >= 5:
         day_name = 'Saturday' if weekday == 5 else 'Sunday'
         logger.info('Today is %s. No automation runs on weekends. Exiting.', day_name)
@@ -673,6 +768,16 @@ def main() -> None:
     # Weekend check
     check_weekday()
 
+    # ── Startup banner ────────────────────────────────────────────────────────
+    wib_now = now_wib()
+    logger.info('=' * 60)
+    logger.info('Jira Support Task Automation')
+    logger.info('  Date/Time : %s WIB', wib_now.strftime('%Y-%m-%d %H:%M:%S'))
+    logger.info('  Domain    : %s', JIRA_DOMAIN)
+    logger.info('  Email     : %s', os.environ.get('JIRA_EMAIL', JIRA_EMAIL))
+    logger.info('=' * 60)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Determine time slot
     time_slot = args.time_slot
     if time_slot == 'auto':
@@ -691,11 +796,22 @@ def main() -> None:
         issues = search_issues(jql)
         if issues:
             logger.info('Found %d issue(s):', len(issues))
+            logger.info('  %-20s %-16s %-22s %-22s %s',
+                        'Key', 'Status', 'Plan Start (WIB)', 'Plan End (WIB)', 'Summary')
+            logger.info('  %s', '-' * 100)
             for issue in issues:
-                key = issue['key']
-                summary = issue.get('fields', {}).get('summary', '(no summary)')
-                status = issue.get('fields', {}).get('status', {}).get('name', 'unknown')
-                logger.info('  [%s] %s (status: %s)', key, summary, status)
+                f = issue.get('fields', {})
+                start_raw = f.get('customfield_10093', '')
+                end_raw   = f.get('customfield_10094', '')
+                start_dt  = parse_issue_datetime(start_raw)
+                end_dt    = parse_issue_datetime(end_raw)
+                start_str = start_dt.astimezone(_WIB).strftime('%Y-%m-%d %H:%M') if start_dt else 'N/A'
+                end_str   = end_dt.astimezone(_WIB).strftime('%Y-%m-%d %H:%M')   if end_dt   else 'N/A'
+                status    = f.get('status', {}).get('name', 'unknown')
+                summary   = f.get('summary', '(no summary)')[:45]
+                logger.info('  %-20s %-16s %-22s %-22s %s',
+                            issue['key'], status, start_str, end_str, summary)
+            logger.info('  %s', '-' * 100)
         else:
             logger.info('No issues found.')
         return
